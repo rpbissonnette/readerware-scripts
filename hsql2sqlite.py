@@ -3,12 +3,38 @@ from io import BytesIO, StringIO
 from PIL import Image
 
 # Global defines, change for your needs
-# Readerware Save file
-originalBackupScript = "Readerware.rw3.bkup.script"
-# Transliterated sqlite3 output file
-output_db = "output.db"
 
-# map schema types
+originalBackupScript = "Readerware.rw3.bkup.script" # Backupscript Save file made by Readerware
+output_db = "output.db" # Transliterated and transformed sqlite3 output file
+
+# Default width x height sizes for cover images
+SMALL_COVER = (150, 150)
+LARGE_COVER = (300, 300)
+    # Increase CSV field size limit for large text fields - big cover images!
+csv.field_size_limit(10 * 1024 * 1024)  # 10MB limit
+
+# Some symbolic names that will be used to access the create table artifact
+# names, numbers correspond to this line:
+#     return sqlite_schema,  transforms, all_columns, coversIndex
+createSQL = 0           # schema[][0] = STRING of CREATE commands for this schema
+TRANSFORM_LIST = 1      # schema[][1] = LIST of transforms for each column
+COLUMNS_LIST = 2        # schema[][2] = LIST of Column NAMES
+COVER_IMAGE_COLUMN_INDEX = 3 # saves Where we discovered the IMAGE1 column
+
+# globals and preliminary input sort cache files since i am lazy
+# PEP 8 Best Practices all willfully ignore - at my own peril.  You have been warned.
+
+originalRWschema = {}   # The Readerware v 3.4 hsqldb schema
+schemas = {}            # The equivalent sqlite3 schema and transforms
+
+# python caches for the original backup script lines
+createLines = io.StringIO()             # really anyting Not an Insert Values
+readerwareLines = io.StringIO()         # the main table, we want to load it last
+otherInsertLines = io.StringIO()        # data for the remaining tables
+sortedInserts = io.StringIO()  
+
+# map schema types      # have already dropped any "CACHED" appearances
+# be aware that often a BIGINT will be a foreign key to an other table.
 def map_to_sqlite_type(readerware_type):
     """Map Readerware/HSQLDB types to SQLite types"""
     type_upper = readerware_type.upper()
@@ -106,7 +132,7 @@ def parse_boolean(value):
     return None
 
 
-def parse_blob(value):
+def parse_blob(value):          # this has been specialized since we know only cover images apply
     """Convert hex string to binary blob"""
     if not value or value == 'NULL':
         return None
@@ -116,7 +142,7 @@ def parse_blob(value):
         return None
 
 
-def process_image(binary_data, target_size=(150, 150)):
+def process_image(binary_data, target_size=SMALL_COVER):
     """
     Convert hex string to resized JPEG blob.
     Returns None if processing fails.
@@ -161,12 +187,14 @@ def parse_create_table(table: str) -> None:
     Args:
     Returns: (sqlite_schema, column_transforms, column_names, column_indices, insert_column_names)
     """
-    if table == "READERWARE":
-        print("break")
+    # expect these two will be set for the READERWARE table only, 
+    # set here to ignore for the other tables
     descriptionIndex = None
     coversIndex = None
 
+    # Get the hsqldb create table line for this table into create_sql
     create_sql = originalRWschema[table]
+
     # Extract column definitions
     match = re.search(r'CREATE.*?TABLE\s+(\w+)\s*\((.*)\)', create_sql, re.DOTALL | re.IGNORECASE)
     if not match:
@@ -248,14 +276,14 @@ def parse_create_table(table: str) -> None:
         if transform_func:
             transforms[orig_idx] = transform_func
 
-    if table == 'READERWARE':
+    if table == 'READERWARE':       # Locate the columns for special processing.
         descriptionIndex = sqlite_columns.index("PRODUCT_INFO TEXT")
+        if descriptionIndex :
+            transforms[descriptionIndex] = clean_product_info
         coversIndex = sqlite_columns.index("IMAGE1_DATA BLOB")
     sqlite_schema = f"CREATE TABLE {table} ({', '.join(sqlite_columns)})"
     
-    # return sqlite_schema, transforms, all_columns, column_indices, insert_columns
-
-    return sqlite_schema,  transforms, all_columns, descriptionIndex, coversIndex
+    return sqlite_schema,  transforms, all_columns, coversIndex
 
 def processReaderwareHSQLDBschemas() -> None:
     """Read the backup script file and extract CREATE TABLE statements"""
@@ -291,71 +319,59 @@ def processReaderwareHSQLDBschemas() -> None:
     
     return
 
-def diag():
+def diag(lastrowid):
+    """Display the record that was just inserted"""
+    """Mostly a check to see consistency of INNER JOINs """
+    
+    if not lastrowid:
+        return
+    
     sql = """
         SELECT
             r.ROWKEY,
             r.TITLE AS "Title",
             r.SUBTITLE AS "Subtitle",
             r.PAGES AS "Pages",
-            a.NAME AS "Author",
-            a1.NAME AS "Author1",
-            a2.NAME AS "Author2",
-            a3.NAME AS "Author3",			
-            pp.LISTITEM as PublicationPlace,
-            lan.LISTITEM as Lanuage,
-            k1.LISTITEM as CATEGORY1,
-            k2.LISTITEM as CATEGORY2,
-            k3.LISTITEM as CATEGORY3,
-            f.LISTITEM as FORMAT,
-            p.LISTITEM as publisher,
-            l.LISTITEM as ReadingLevel,
-            c1.NAME AS Primary_Author,
-            c2.NAME AS Co_Author,
-            c3.NAME AS "3rd Author",
-            c4.NAME AS "4th Author",
-            r.ISBN,
-            COALESCE(r.IMAGE1_LARGE_DATA,
-                r.IMAGE2_LARGE_DATA,
-                r.IMAGE1_DATA,
-                r.IMAGE2_DATA)      AS cover_blob
-            FROM READERWARE r
-            LEFT JOIN CONTRIBUTOR a on a.ROWKEY == r.AUTHOR
-            LEFT JOIN CONTRIBUTOR a1 on a1.ROWKEY == r.AUTHOR2
-            LEFT JOIN CONTRIBUTOR a2 on a1.ROWKEY == r.AUTHOR3
-            LEFT JOIN CONTRIBUTOR a3 on a1.ROWKEY == r.AUTHOR4
-            LEFT JOIN PUBLICATION_PLACE_LIST pp on r.PUB_PLACE = pp.ROWKEY
-            LEFT JOIN LANGUAGE_LIST lan on r.CONTENT_LANGUAGE = lan.ROWKEY
-            LEFT JOIN CATEGORY_LIST k1 on r.CATEGORY1 = k1.ROWKEY
-            LEFT JOIN CATEGORY_LIST k2 on r.CATEGORY2 = k2.ROWKEY
-            LEFT JOIN CATEGORY_LIST k3 on r.CATEGORY3 = k3.ROWKEY
-            LEFT JOIN FORMAT_LIST f ON r.FORMAT = f.ROWKEY
-            LEFT JOIN PUBLISHER_LIST p ON r.PUBLISHER = p.ROWKEY
-            LEFT JOIN READING_LEVEL_LIST l on r.READING_LEVEL = l.ROWKEY
-            LEFT JOIN CONTRIBUTOR c1 ON r.AUTHOR  = c1.ROWKEY
-            LEFT JOIN CONTRIBUTOR c2 ON r.AUTHOR2 = c2.ROWKEY
-            LEFT JOIN CONTRIBUTOR c3 ON r.AUTHOR3 = c3.ROWKEY
-            LEFT JOIN CONTRIBUTOR c4 ON r.AUTHOR4 = c4.ROWKEY;
+            c1.NAME AS "Primary_Author",
+            c2.NAME AS "Author2",
+            c3.NAME AS "Author3",
+            c4.NAME AS "Author4",
+            pp.LISTITEM as "PublicationPlace",
+            lan.LISTITEM as "Language",
+            k1.LISTITEM as "CATEGORY1",
+            k2.LISTITEM as "CATEGORY2",
+            k3.LISTITEM as "CATEGORY3",
+            f.LISTITEM as "FORMAT",
+            p.LISTITEM as "Publisher",
+            l.LISTITEM as "ReadingLevel",
+            r.ISBN
+        FROM READERWARE r
+        LEFT JOIN CONTRIBUTOR c1 ON r.AUTHOR = c1.ROWKEY
+        LEFT JOIN CONTRIBUTOR c2 ON r.AUTHOR2 = c2.ROWKEY
+        LEFT JOIN CONTRIBUTOR c3 ON r.AUTHOR3 = c3.ROWKEY
+        LEFT JOIN CONTRIBUTOR c4 ON r.AUTHOR4 = c4.ROWKEY
+        LEFT JOIN PUBLICATION_PLACE_LIST pp ON r.PUB_PLACE = pp.ROWKEY
+        LEFT JOIN LANGUAGE_LIST lan ON r.CONTENT_LANGUAGE = lan.ROWKEY
+        LEFT JOIN CATEGORY_LIST k1 ON r.CATEGORY1 = k1.ROWKEY
+        LEFT JOIN CATEGORY_LIST k2 ON r.CATEGORY2 = k2.ROWKEY
+        LEFT JOIN CATEGORY_LIST k3 ON r.CATEGORY3 = k3.ROWKEY
+        LEFT JOIN FORMAT_LIST f ON r.FORMAT = f.ROWKEY
+        LEFT JOIN PUBLISHER_LIST p ON r.PUBLISHER = p.ROWKEY
+        LEFT JOIN READING_LEVEL_LIST l ON r.READING_LEVEL = l.ROWKEY
+        WHERE r.ROWKEY = ?;
         """
     try:
-        cursor.execute(sql)
-        all = cursor.fetchall()
-        # if len(all) != 0:
-        #     print(f"  {all[:4]}")
+        cursor.execute(sql, (lastrowid,))
+        row = cursor.fetchone()
+        if row:
+            print(f"  ID: {row[0]}, Title: {row[1][:40] if row[1] else 'N/A'}..., Author: {row[4] if row[4] else 'N/A'}, Publisher: {row[14] if row[14] else 'N/A'}")
     except Exception as e:
-        print(e)
+        print(f"Diagnostic query error: {e}")
 
 def convert_readerware_to_sqlite() -> None:
     """
-    Convert Readerware backup to SQLite database.
-    Args:
-        conn: SQLite connection
-        cursor: SQLite cursor
-        bkupscript_file: Path to Readerware backup script
+    Actually execute the INSERT VALUES commands.
     """
-    # Increase CSV field size limit for large text fields
-    csv.field_size_limit(10 * 1024 * 1024)  # 10MB limit
-    
     # Process INSERT statements
     insert_count = 0
     error_count = 0
@@ -368,7 +384,7 @@ def convert_readerware_to_sqlite() -> None:
             values_str = match.group(2)
 
             try:
-                transforms = schemas[table][1]
+                transforms = schemas[table][TRANSFORM_LIST]
 
                 # Use csv.reader to parse (HSQLDB uses '' to escape quotes)
                 reader = csv.reader([values_str], quotechar="'", doublequote=True)
@@ -384,29 +400,39 @@ def convert_readerware_to_sqlite() -> None:
                     # now that the hsqldb -> sqlite3 rewrite rules have been applied, at this point one could
                     # execute clean_product_info and / or process_image optional processing
                     # hardcoding in the indices for the PRODUCT_INFO and Cover Images
-                    description_index = schemas[table][3]
-                    cover_index = schemas[table][4]
-                    if (readyRow[description_index]):
-                        readyRow[description_index] = clean_product_info(readyRow[description_index])
+                    # but transform[description_index] was already on schema creation, 
+                    # so next lines are an example one could change for other special processing.
+                    
+                    # description_index = schemas[table][3]
+                    # if (readyRow[description_index]):
+                    #     readyRow[description_index] = clean_product_info(readyRow[description_index])
+
+                    # My idea about the book cover images - check for the raw length of
+                    # all 4 slots, find the min/max and set the converted / resized binary
+                    # blobs to the first two image columns.
+
+                    cover_index = schemas[table][COVER_IMAGE_COLUMN_INDEX]
+                    images = readyRow[cover_index:cover_index+4]
+                    # new_list = original_list[start:stop:step]
                     try:
                         # searching for the best small and large cover image.
-                        max = 0
+                        max = 0                 # size in bytes
                         maxset = False
                         min = 100000
                         minset = False
-                        for i in range(cover_index,cover_index+4):
-                            if readyRow[i]:
-                                l = len(readyRow[i])
+                        for i in range(len(images)): #cover_index,cover_index+4):
+                            if images[i]:
+                                l = len(images[i])
                                 if (l > 4):
                                     if  (l > max):  
                                         imax = i
                                         max = l
-                                        maxImage = readyRow[i]
+                                        maxImage = images[i]
                                         maxset = True
                                     if (l < min) : 
                                         imin = i
                                         min = l
-                                        minImage = readyRow[i]
+                                        minImage = images[i]
                                         minset = True
                         # Now resize them once and for all.
                         if minset: 
@@ -414,7 +440,7 @@ def convert_readerware_to_sqlite() -> None:
                         else:
                             readyRow[cover_index] = None
                         if maxset:
-                            readyRow[cover_index+1] = process_image(maxImage,(300,300))
+                            readyRow[cover_index+1] = process_image(maxImage,LARGE_COVER)
                         else:
                             readyRow[cover_index+1] = None
                         readyRow[cover_index+2] = None
@@ -424,32 +450,31 @@ def convert_readerware_to_sqlite() -> None:
 
                 # Insert into SQLite (explicitly list columns to exclude IDENTITY columns)
                 placeholders = ','.join(['?'] * len(readyRow))
-                column_list =  ','.join(schemas[table][2])
+                column_list =  ','.join(schemas[table][COLUMNS_LIST])
+
                 cursor.execute(f'INSERT INTO {table} ({column_list}) VALUES ({placeholders})', readyRow)
-                insert_count += 1
-                rc = cursor.rowcount
-                if insert_count % 100 == 0:
-                    conn.commit()  # Commit in batches for better performance
-                    print(f"Processed {insert_count} rows...")
-                    diag()
+                if table == "READERWARE" :
+                    insert_count += 1
+                    if insert_count % 100 == 0:
+                        conn.commit()  # Commit in batches for better performance
+                        print(f"Processed {insert_count} rows, now on {table}...")
+                        diag(cursor.lastrowid)
                     
             except Exception as e:
                 error_count += 1
                 print(f"{table}, {e}")
-
 
 def main():
     # resizer = get_image_resizer
     # Fill originalRWschema, a global dictionary with the original RW CREATE TABLE commands.  
     processReaderwareHSQLDBschemas()  # output in originalRWschema
 
-
     # next convert to sqlite and then create the simple tables.
     for table in originalRWschema:
             try:
                 schemas[table] = parse_create_table(table)
                 cursor.execute(f"DROP TABLE IF EXISTS {table}")
-                cursor.execute(schemas[table][0])
+                cursor.execute(schemas[table][createSQL])
             except Exception as e:
                 print(e)
     conn.commit()
@@ -457,18 +482,13 @@ def main():
     # 2nd pass to insert the actual data
     convert_readerware_to_sqlite()
 
-   
-# globals and preliminary input sort since i am lazy
-originalRWschema = {}   # The Readerware v 3.4 hsqldb schema
-schemas = {}            # The equivalent sqlite3 schema and transforms
-
-# python caches for the original backup script lines
-createLines = io.StringIO()             # really anyting Not an Insert Values
-readerwareLines = io.StringIO()         # the main table, we want to load it last
-otherInsertLines = io.StringIO()        # data for the remaining tables
-sortedInserts = io.StringIO()  
-
 # split the original backup into the order to one-shot process
+# After we order things so that CREATE TABLE lines all come first
+# and then anything NOT for the main READERWARE table, Then
+# during the final insertions the INNER JOIN commands will 
+# return valid data.  If you don't care to see the progress,
+# you could just read through the backup script one time and
+# line by line do things. 
 with open(originalBackupScript, "r") as fin:
     for line in fin.readlines():
         if line.startswith("INSERT INTO"):  
@@ -496,4 +516,3 @@ conn.close()
 print("Conversion complete!")
 
 print("pau hana")
-

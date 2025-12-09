@@ -1,9 +1,16 @@
 certifi==2025.10.5
 charset-normalizer==3.4.4
 idna==3.11
-pillow==12.0.0
 pip==25.3
+# for image resize, either pillow
+pillow==12.0.0
+# or Qt
 pyside6==6.10.0
 pyside6-addons==6.10.0
 pyside6-essentials==6.10.0
 shiboken6==6.10.0
+#
+# next are for using the real hsqldb via java
+JayDeBeApi==1.2.3
+jpype1==1.6.0
+packaging==25.0
