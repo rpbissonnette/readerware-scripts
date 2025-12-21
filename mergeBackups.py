@@ -1,14 +1,26 @@
-def merge_books(source_dbs, target_db, dedup_fields=None):
+import os, sys
+import sqlite3
+from pathlib import Path
+
+''' Merge any number of Readerware 3 SQLite exports into one master.
+    Handles all lookup re-mapping and deduplication.
+'''
+
+def merge_books(source_dbs, target_db):
     """
-    Merge any number of Readerware 3 SQLite exports into one master.
-    Handles all lookup re-mapping and perfect deduplication.
+    The main merging function.
+    source_dbs: list of source DB file paths
+    target_db: target DB file path
+    target created from schema.sql, so repeated runs should produce the same result.
+    Some failure when source DBs have repeated entries.
+    Uses content hash for deduplication.
+    Adds provenance info to lookup tables.
     """
-    import sqlite3
-    from pathlib import Path
+
     errors = 0
 
-    src_lookups = {}
-    reverse_lookups = {}  
+    src_lookups = {}        # should be created once and survives between DBs
+    reverse_lookups = {}    # should be one to one, but for checking integrity failures, repeated inside some DBs
 
     target = sqlite3.connect(target_db)
     target.execute("PRAGMA foreign_keys = OFF")  # speed
@@ -59,9 +71,11 @@ def merge_books(source_dbs, target_db, dedup_fields=None):
         else:
             # Insert new
             try:
-                x= row_dict['PROVENANCE']
-                tc.execute(f"INSERT INTO {table} ({field},merge_source ) VALUES (?,?)", (listitem, x))
+                tc.execute(f"INSERT INTO {table} ({field},merge_source ) VALUES (?,?)", (listitem, row_dict['PROVENANCE']))
                 rowkey = tc.lastrowid
+            except sqlite3.IntegrityError as e:
+                print(f"Integrity error inserting ({field}) ({listitem}) into ({table}): {e}")
+                return None
             except Exception as e:
                 print(e)
                 return None
@@ -75,6 +89,18 @@ def merge_books(source_dbs, target_db, dedup_fields=None):
         print(f"\nMerging {src_path} → {target_db}")
         src = sqlite3.connect(src_path)
         sc = src.cursor()
+        try:
+            # Verify integrity of source DB
+            sc.execute("PRAGMA integrity_check")
+            result = sc.fetchone()
+            if result == ('ok',):
+                print(f"Database '{src_path}' is valid and connection is solid.")
+            else:
+                print(f"Database '{src_path}' has integrity issues: {result}")
+
+        except sqlite3.Error as e:
+            print(f"Failed to connect or verify database integrity: {e}")
+
 
         # Build local lookup caches for this source (speed)
         # if not src_lookups:
@@ -137,8 +163,8 @@ def merge_books(source_dbs, target_db, dedup_fields=None):
             # 3c. Check if this exact book already exists in target
             tc.execute("SELECT ROWKEY FROM BOOKS WHERE HASH = ?", (hash,))
             exists = tc.fetchone()
-            if exists:
-                pass    # No need to reinsert!  I hope.
+            if exists and isinstance(exists, tuple) :
+                continue    # No need to reinsert!  I hope.
 
             # 3d. Insert new book
             cols = ", ".join(f'"{c}"' for c in row_dict.keys())
@@ -162,18 +188,20 @@ def merge_books(source_dbs, target_db, dedup_fields=None):
     print("\nAll done. Master database ready.")
 
 if __name__ == "__main__":
-    import os, sys
-    import sqlite3
-    if len(sys.argv) < 4:
-        print("Usage: grok-hsql2sqlite.py target_db source_db1 [source_db2 ...]")
+
+    if len(sys.argv) < 3:
+        print("Usage: Hsql2sqlite.py target_db dbSources_directory")
         sys.exit(1)
+
     target_db = sys.argv[1]
-    source_dbs = sys.argv[2:]
+    source_dbs = sys.argv[2]
     if os.path.exists(target_db):
         os.unlink(target_db)
     workDir = os.path.dirname(target_db)
+
+    # Create target DB from schema.sql
     schemaPath = os.path.join(workDir, "schema.sql")
-    with open(schemaPath, "r", encoding="utf-8") as f:
+    with open(schemaPath, "r") as f:
         try:
             schema_sql = f.read()
             target = sqlite3.connect(target_db)
@@ -185,15 +213,16 @@ if __name__ == "__main__":
             print("Error creating target DB schema:", e)
             sys.exit(1)
 
+    # hardcoded db names for my use, ordered by size/date
     sources = [ 
         "Books To Read Next.db",
         "BorrowedBooks.db" ,
-        "MyOwnBooksB.db",
+        "MyOwnBooks.db",
         "BookCatalog.db",
         "McCollough.db",
         "Readerware.db",
         "NewMcCollough.db"]
-    source_dbs = [os.path.join("/home/rpbiss/PyCharm/dbPrep/rw_converted", s) for s in sources]
+    source_dbs = [os.path.join(source_dbs, s) for s in sources]
   
     merge_books(source_dbs, target_db)
   
