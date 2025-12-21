@@ -475,16 +475,16 @@ def parse_create_table(table: str) -> None:
             transforms[70] = clean_string
             transforms[71] = clean_string
 
-            sqlite_columns.append(f"FOREIGN KEY('AUTHOR')  REFERENCES CONTRIBUTOR(ROWKEY)")
-            sqlite_columns.append(f"FOREIGN KEY('AUTHOR2') REFERENCES CONTRIBUTOR(ROWKEY)")
-            sqlite_columns.append(f"FOREIGN KEY('AUTHOR3') REFERENCES CONTRIBUTOR(ROWKEY)")
-            sqlite_columns.append(f"FOREIGN KEY('FORMAT') REFERENCES FORMAT_LST(ROWKEY)")
-            sqlite_columns.append(f"FOREIGN KEY('PUBLISHER') REFERENCES PUBLISHER_LIST(ROWKEY)")
-            sqlite_columns.append(f"FOREIGN KEY('PUB_PLACE') REFERENCES PUBLICATION_PLACE_LIST(ROWKEY)")
-            sqlite_columns.append(f"FOREIGN KEY('CONTENT_LANGUAGE') REFERENCES LANGUAGE_LIST(ROWKEY)")
-            sqlite_columns.append(f"FOREIGN KEY('CATEGORY1') REFERENCES CATEGORY_LIST(ROWKEY)")
-            sqlite_columns.append(f"FOREIGN KEY('CATEGORY2') REFERENCES CATEGORY_LIST(ROWKEY)")
-            sqlite_columns.append(f"FOREIGN KEY('CATEGORY3') REFERENCES CATEGORY_LIST(ROWKEY)")
+            # sqlite_columns.append(f"FOREIGN KEY('AUTHOR')  REFERENCES CONTRIBUTOR(ROWKEY)")
+            # sqlite_columns.append(f"FOREIGN KEY('AUTHOR2') REFERENCES CONTRIBUTOR(ROWKEY)")
+            # sqlite_columns.append(f"FOREIGN KEY('AUTHOR3') REFERENCES CONTRIBUTOR(ROWKEY)")
+            # sqlite_columns.append(f"FOREIGN KEY('FORMAT') REFERENCES FORMAT_LST(ROWKEY)")
+            # sqlite_columns.append(f"FOREIGN KEY('PUBLISHER') REFERENCES PUBLISHER_LIST(ROWKEY)")
+            # sqlite_columns.append(f"FOREIGN KEY('PUB_PLACE') REFERENCES PUBLICATION_PLACE_LIST(ROWKEY)")
+            # sqlite_columns.append(f"FOREIGN KEY('CONTENT_LANGUAGE') REFERENCES LANGUAGE_LIST(ROWKEY)")
+            # sqlite_columns.append(f"FOREIGN KEY('CATEGORY1') REFERENCES CATEGORY_LIST(ROWKEY)")
+            # sqlite_columns.append(f"FOREIGN KEY('CATEGORY2') REFERENCES CATEGORY_LIST(ROWKEY)")
+            # sqlite_columns.append(f"FOREIGN KEY('CATEGORY3') REFERENCES CATEGORY_LIST(ROWKEY)")
 
         except Exception as e:
             print(e)    
@@ -605,6 +605,7 @@ def insert_readerware_into_sqlite(cursor, con):
                 except Exception as e:
                                 print(e)
                 # readyRow[0] = None
+                msg = f"({readyRow[:2]} , {table} )"
                 cursor.execute(f'INSERT INTO {table} ({column_list}) VALUES ({placeholders})', readyRow)
                 if table == "READERWARE" :
                     insert_count += 1
@@ -614,7 +615,26 @@ def insert_readerware_into_sqlite(cursor, con):
                     
             except Exception as e:
                 error_count += 1
-                print(f"{table}, {e}")
+                # print(f"{table}, {e}")
+                print(e, msg)
+
+                '''
+
+                msg meaing:
+
+                On the big conversion run for Evansville Public Library, we get notice of 
+                duplicates in these lookup tables, but since the original is there, only the main
+                entries using them will be broken?
+
+                Input /home/rpbiss/PyCharm/dbPrep/bkup/NewMcCollough.rw3.bkup.script has been split, ready for the converstion passes
+                    ([453, 'Richard L. Hudson'] , CONTRIBUTOR )
+                    ([986, 'Emily Herring'] , CONTRIBUTOR )
+                    ([993, 'Anil Ananthaswamy'] , CONTRIBUTOR )
+                    ([1014, 'Annie Jacobsen'] , CONTRIBUTOR )
+                    ([299, 'Beacon Press'] , PUBLISHER_LIST )
+                    ([307, 'William Morrow'] , PUBLISHER_LIST )
+                                    
+                '''
 
 def processRWbackup( srcPath, targetDBpath) -> None:
     
@@ -678,6 +698,27 @@ def processRWbackup( srcPath, targetDBpath) -> None:
                     cursor.execute(schemas[table][createSQL])
                 except Exception as e:
                     print(e)
+            
+            con.commit()
+            # Now that all the table schemas have been created, we add these indexes
+            for table, text_col in [
+                ("CONTRIBUTOR", "NAME"),
+                ("PUBLISHER_LIST", "LISTITEM"),
+                ("PUBLICATION_PLACE_LIST", "LISTITEM"),
+                ("CATEGORY_LIST", "LISTITEM"),
+                ("FORMAT_LIST", "LISTITEM"),
+                ("LANGUAGE_LIST", "LISTITEM"),
+            ]:
+                try:
+                    cn = f"{table}".lower().replace("_list","")
+                    # print(table, text_col)
+                    cursor.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_{cn} ON [{table}](UPPER({text_col}))")
+                    # print(table, text_col)
+                except sqlite3.OperationalError: 
+                    pass
+                except Exception as e: 
+                    print(e)
+            con.commit()
 
             try:
                 insert_readerware_into_sqlite(cursor, con) 
@@ -694,7 +735,10 @@ PROVENANCE_MAP = {
     "Books To Read Next.rw3.bkup.script": "Personal Backlog",
     "BorrowedBooks.rw3.bkup.script" : "Borrowed",
     "MyOwnBooksB.rw3.bkup.script" : "rpbiss",
-    "NewMcCollough.rw3.bkup.script": "Evansville Public Library"
+    "BookCatalog.rw3.bkup.script": "BookCatalog",
+    "McCollough.rw3.bkup.script": "McCollough",
+    "Readerware.rw3.bkup.script": "Readerware",
+    "NewMcCollough.rw3.bkup.script": "Evansville Public Library",
     # Add more: {"filename": "Human-readable label"}
 }
 
