@@ -5,6 +5,7 @@ from pathlib import Path
 ''' Merge any number of Readerware 3 SQLite exports into one master.
     Handles all lookup re-mapping and deduplication.
 '''
+fout = open("mergeBackups.log", "w", encoding="utf-8")
 
 def merge_books(source_dbs, target_db):
     """
@@ -21,6 +22,9 @@ def merge_books(source_dbs, target_db):
 
     src_lookups = {}        # should be created once and survives between DBs
     reverse_lookups = {}    # should be one to one, but for checking integrity failures, repeated inside some DBs
+
+    # print("address of src_lookups:", id(src_lookups))
+    # print("address of reverse_lookups:", id(reverse_lookups))
 
     target = sqlite3.connect(target_db)
     target.execute("PRAGMA foreign_keys = OFF")  # speed
@@ -51,35 +55,76 @@ def merge_books(source_dbs, target_db):
         "LANGUAGE_LIST":  {},
     }
 
-    def get_or_create_lookup(table, listitem):
-        listitem = (listitem or "").strip()
-        if not listitem:
-            return None
-        map_dict = lookup_maps[table]
-        if listitem in map_dict:
-            return map_dict[listitem]
-
+    def get_or_create_lookup(table, item):
+        """ Given a lookup table name and a text value, return the ROWKEY in target DB.
+            If not found, insert a new entry and return that ROWKEY.
+            Caches results in lookup_maps for speed.
+        """
+        name = None
         # Look in target first
         if table == "CONTRIBUTOR":
+            try:         
+                name = (item[0] or "").strip()
+                fout.write(f"\nLooking up CONTRIBUTOR: '{name}' ")
+                if name == "Wil Mccarthy": # or name == "Bill O'Reilly":  
+                    print("debug")
+
+            except Exception as e:
+                return None
+            
+            map_dict = lookup_maps[table]
+            if name == 'Wil Mccarthy':
+                print(len(map_dict))
+            if item in map_dict:
+                print(f"Found {table} '{name}' in cache with ROWKEY {map_dict[item]}"  )
+                return map_dict[item]
+            
             field = "NAME"
+            try:
+                tc.execute(f"SELECT ROWKEY, NAME, SORT_NAME FROM {table} WHERE {field} = ?", (name,))
+                print(f"Queried {table} for '{name}'")
+            except Exception as e:
+                print(e)
+
         else:
+            listitem = (item or "").strip()
+            if not listitem:
+                return None
+            map_dict = lookup_maps[table]
+            if listitem in map_dict:
+                return map_dict[listitem]
             field = "LISTITEM"
-        tc.execute(f"SELECT ROWKEY FROM {table} WHERE {field} = ?", (listitem,))
+            tc.execute(f"SELECT ROWKEY FROM {table} WHERE {field} = ?", (listitem,))
+            print(f"Queried {table} for '{listitem}'")
+
         row = tc.fetchone()
         if row:
             rowkey = row[0]
+            print(f"Found existing {table} ROWKEY {rowkey} for '{item}'")
         else:
             # Insert new
             try:
-                tc.execute(f"INSERT INTO {table} ({field},merge_source ) VALUES (?,?)", (listitem, row_dict['PROVENANCE']))
+                if table == "CONTRIBUTOR":
+                    fout.write(f" => Inserting '{name}' ")
+                    sort_name = item[1]
+
+                    tc.execute(f"INSERT INTO {table} ({field}, SORT_NAME, merge_source ) VALUES (?,?,?)", (name, sort_name, row_dict['PROVENANCE']))    
+                    fout.write(f" -> ROWKEY {tc.lastrowid}")
+                else:
+                    tc.execute(f"INSERT INTO {table} ({field},merge_source ) VALUES (?,?)", (item, row_dict['PROVENANCE']))
+
                 rowkey = tc.lastrowid
             except sqlite3.IntegrityError as e:
-                print(f"Integrity error inserting ({field}) ({listitem}) into ({table}): {e}")
+                fout.write(f"Fail !!  -> ROWKEY {tc.lastrowid}")
+                print(f"Integrity error inserting ({field}) ({item}) into ({table}): {e}")
                 return None
             except Exception as e:
-                print(e)
+                print(f"Error inserting ({field}) ({item}) into ({table}): {e}")
                 return None
-        map_dict[listitem] = rowkey
+        map_dict[item] = rowkey
+        if[0] == "Wil Mccarthy":
+            print
+        print(f"Mapped {table} '{item}' to ROWKEY {rowkey}")
         return rowkey
 
     # ------------------------------------------------------------------
@@ -111,19 +156,25 @@ def merge_books(source_dbs, target_db):
             if table not in src_lookups:
                 src_lookups[table] = {}
             if table == "CONTRIBUTOR":
-                sc.execute(f"SELECT ROWKEY, NAME FROM {table}") # different text col, sigh
+                sc.execute(f"SELECT ROWKEY, NAME, SORT_NAME FROM {table}") # different text col, sigh
+                for rowkey, name, sort_name in sc.fetchall():
+                    name = (name or "").strip()
+                    if name:
+                        src_lookups[table][rowkey] = name, sort_name
+                        reverse_lookups.setdefault(table, {}).setdefault(name, []).append(rowkey)   
             else:
                 sc.execute(f"SELECT ROWKEY, LISTITEM FROM {table}")
-            for rowkey, name in sc.fetchall():
-                name = (name or "").strip()
-                if name:
-                    src_lookups[table][rowkey] = name
-                    reverse_lookups.setdefault(table, {}).setdefault(name, []).append(rowkey)   
+                for rowkey, name in sc.fetchall():
+                    name = (name or "").strip()
+                    if name:
+                        src_lookups[table][rowkey] = name
+                        reverse_lookups.setdefault(table, {}).setdefault(name, []).append(rowkey)   
 
-        for table, name_map in reverse_lookups.items():
-            for name, keys in name_map.items():
-                if len(keys) > 1:
-                    print(f"Warning: In source {src_path}, {table} has duplicate entries for '{name}': {keys}")     
+        # for table, name_map in reverse_lookups.items():
+        #     for name, keys in name_map.items():
+        #         unique_keys = set(keys)
+        #         if len(unique_keys) > 1:
+        #             print(f"Warning: In source {src_path}, {table} has duplicate entries for '{name}': {keys}")     
 
         # ------------------------------------------------------------------
         # 3. Iterate every book in source
@@ -154,9 +205,12 @@ def merge_books(source_dbs, target_db):
                 '''
                 old_key = row_dict.get(field)
                 if old_key is not None:
-                    old_name = src_lookups[table].get(old_key, "").strip()
-                    new_key = get_or_create_lookup(table, old_name)
-                    row_dict[field] = new_key
+                    old_name = src_lookups[table].get(old_key, "")
+                    if old_name == "":
+                        print(f"Warning: In source {src_path}, no name found for {table} ROWKEY {old_key} (field {field}) in book '{row_dict.get('TITLE', '')}'")
+                    else:
+                        new_key = get_or_create_lookup(table, old_name) #rc_lookups)
+                        row_dict[field] = new_key
 
             # 3. get the current hash value for deduplication
             hash = row_dict['HASH']
@@ -174,7 +228,7 @@ def merge_books(source_dbs, target_db):
                 tc.execute(f"INSERT INTO BOOKS ({cols}) VALUES ({placeholders})",
                         list(row_dict.values()))
             except Exception as e:
-                print(f"{errors} {inserted} {row_dict['TITLE']}")
+                print(f"{errors} {inserted} {row_dict['TITLE']} {e}")
                 errors += 1
                 pass
             inserted += 1
@@ -188,13 +242,10 @@ def merge_books(source_dbs, target_db):
     print("\nAll done. Master database ready.")
 
 if __name__ == "__main__":
+# hardcoded paths for my use, adjust as needed
+    target_db = "converted_readerware/books.db"
+    source_dbs = "rw_converted"
 
-    if len(sys.argv) < 3:
-        print("Usage: Hsql2sqlite.py target_db dbSources_directory")
-        sys.exit(1)
-
-    target_db = sys.argv[1]
-    source_dbs = sys.argv[2]
     if os.path.exists(target_db):
         os.unlink(target_db)
     workDir = os.path.dirname(target_db)
@@ -220,9 +271,9 @@ if __name__ == "__main__":
         "MyOwnBooks.db",
         "BookCatalog.db",
         "McCollough.db",
-        "Readerware.db",
         "NewMcCollough.db"]
     source_dbs = [os.path.join(source_dbs, s) for s in sources]
   
     merge_books(source_dbs, target_db)
+    fout.close()
   
