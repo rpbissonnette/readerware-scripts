@@ -8,10 +8,13 @@ import binascii, csv, hashlib, io, os, re, sqlite3, sys
 from io import BytesIO, StringIO
 from PIL import Image
 from contextlib import closing
+from typing import Dict, List, Set, Tuple, Any, DefaultDict
 
 from pathlib import Path
 from datetime import datetime
 from contextlib import closing
+
+currentRow = None
 
 # Global defines, change for your needs
 
@@ -149,10 +152,20 @@ def get_transform_function(col_type, is_not_null):
 
 # Transformation functions
 def clean_string(value):
-    """Clean string values, unescape quotes"""
+    """Clean string values, unescape quotes and decode unicode escapes"""
     if not value or value == 'NULL':
         return None
-    return value.replace("''", "'").strip()
+    # Unescape quotes and decode common unicode escape sequences
+    cleaned_value = value.replace("''", "'")
+    try:
+        # Attempt to decode unicode escape sequences
+        # The 'unicode_escape' codec expects a bytes-like object,
+        # so we first encode to latin1 (a 1:1 mapping for first 256 chars)
+        # then decode the escaped unicode.
+        return cleaned_value.encode('latin1').decode('unicode_escape').strip()
+    except (UnicodeDecodeError, AttributeError):
+        # If decoding fails or not a string, return the cleaned value as is
+        return cleaned_value.strip()
 
 
 def parse_int(value):
@@ -289,6 +302,10 @@ def process_image(binary_data, target_size=SMALL_COVER):
         # Scale down while preserving aspect ratio
         if img.format != 'JPEG':    # somehow there are 2 .gif files.  Sigh.
             img = img.convert("RGB") 
+
+        if len(binary_data) < 2000:
+            print(f"Processing image of size: {len(binary_data)} bytes, format: {img.format}, dimensions: {img.width}x{img.height}")
+        
         img.thumbnail(target_size, Image.Resampling.LANCZOS)
         # print(f"Resized image dimensions: {img.width}x{img.height}")
         # Save to bytes
@@ -300,20 +317,22 @@ def process_image(binary_data, target_size=SMALL_COVER):
         print(e)
 
 
+
+
 def clean_product_info(text):
     """Clean up product descriptions"""
     if not text or text == 'NULL':
         return None
     
-    text = text.replace("''", "'")  # Unescape quotes
-    text = text.replace('\\u000a', '\n')  # Fix newlines
+    text = clean_string(text)  # Use the generic string cleaner
+    if text is None:
+        return None
     
     # Remove "Book Description" prefix
     if text.startswith('Book Description\n'):
         text = text[17:]  # len('Book Description\n')
     
     return text.strip()
-
 
 def getOriginalReaderwareHSQLDBschemas() -> None:
     """Read the backup script file and extract CREATE TABLE statements"""
@@ -475,16 +494,16 @@ def parse_create_table(table: str) -> None:
             transforms[70] = clean_string
             transforms[71] = clean_string
 
-            # sqlite_columns.append(f"FOREIGN KEY('AUTHOR')  REFERENCES CONTRIBUTOR(ROWKEY)")
-            # sqlite_columns.append(f"FOREIGN KEY('AUTHOR2') REFERENCES CONTRIBUTOR(ROWKEY)")
-            # sqlite_columns.append(f"FOREIGN KEY('AUTHOR3') REFERENCES CONTRIBUTOR(ROWKEY)")
-            # sqlite_columns.append(f"FOREIGN KEY('FORMAT') REFERENCES FORMAT_LST(ROWKEY)")
-            # sqlite_columns.append(f"FOREIGN KEY('PUBLISHER') REFERENCES PUBLISHER_LIST(ROWKEY)")
-            # sqlite_columns.append(f"FOREIGN KEY('PUB_PLACE') REFERENCES PUBLICATION_PLACE_LIST(ROWKEY)")
-            # sqlite_columns.append(f"FOREIGN KEY('CONTENT_LANGUAGE') REFERENCES LANGUAGE_LIST(ROWKEY)")
-            # sqlite_columns.append(f"FOREIGN KEY('CATEGORY1') REFERENCES CATEGORY_LIST(ROWKEY)")
-            # sqlite_columns.append(f"FOREIGN KEY('CATEGORY2') REFERENCES CATEGORY_LIST(ROWKEY)")
-            # sqlite_columns.append(f"FOREIGN KEY('CATEGORY3') REFERENCES CATEGORY_LIST(ROWKEY)")
+            sqlite_columns.append(f"FOREIGN KEY('AUTHOR')  REFERENCES CONTRIBUTOR(ROWKEY)")
+            sqlite_columns.append(f"FOREIGN KEY('AUTHOR2') REFERENCES CONTRIBUTOR(ROWKEY)")
+            sqlite_columns.append(f"FOREIGN KEY('AUTHOR3') REFERENCES CONTRIBUTOR(ROWKEY)")
+            sqlite_columns.append(f"FOREIGN KEY('FORMAT') REFERENCES FORMAT_LST(ROWKEY)")
+            sqlite_columns.append(f"FOREIGN KEY('PUBLISHER') REFERENCES PUBLISHER_LIST(ROWKEY)")
+            sqlite_columns.append(f"FOREIGN KEY('PUB_PLACE') REFERENCES PUBLICATION_PLACE_LIST(ROWKEY)")
+            sqlite_columns.append(f"FOREIGN KEY('CONTENT_LANGUAGE') REFERENCES LANGUAGE_LIST(ROWKEY)")
+            sqlite_columns.append(f"FOREIGN KEY('CATEGORY1') REFERENCES CATEGORY_LIST(ROWKEY)")
+            sqlite_columns.append(f"FOREIGN KEY('CATEGORY2') REFERENCES CATEGORY_LIST(ROWKEY)")
+            sqlite_columns.append(f"FOREIGN KEY('CATEGORY3') REFERENCES CATEGORY_LIST(ROWKEY)")
 
         except Exception as e:
             print(e)    
@@ -496,6 +515,7 @@ def parse_create_table(table: str) -> None:
 def insert_readerware_into_sqlite(cursor, con):
     # global provenance, import_time 
     # Process INSERT statements
+    global currentRow
     insert_count = 0
     error_count = 0
     # carve out the the table name and then the values
@@ -506,7 +526,7 @@ def insert_readerware_into_sqlite(cursor, con):
         if  match:
             table = match.group(1)
             values_str = match.group(2)
-
+            msg = ""
             try:
                 transforms = schemas[table][TRANSFORM_LIST]
                 readyRow = []   # to quiet possible unbound warning
@@ -514,6 +534,7 @@ def insert_readerware_into_sqlite(cursor, con):
                 reader = csv.reader([values_str], quotechar="'", doublequote=True)
                 for row in reader:
                     readyRow = []
+                    currentRow = row[0]
                     for orig_idx, value in enumerate(row):
                         if orig_idx in transforms:
                             readyRow.append(transforms[orig_idx](value))
@@ -563,6 +584,8 @@ def insert_readerware_into_sqlite(cursor, con):
                         maxset = False
                         min = 100000
                         minset = False
+                        print(f"book {readyRow[HASH_FIELDS.index('TITLE')]}")
+                        print(f"image sizes: {[len(i) if i else 0 for i in images]}")
                         for i in range(len(images)): #cover_index,cover_index+4):
                             if images[i]:
                                 l = len(images[i])
@@ -577,6 +600,13 @@ def insert_readerware_into_sqlite(cursor, con):
                                         min = l
                                         minImage = images[i]
                                         minset = True
+                        # Drop very small images, they are not useful and just take up space.  If we have a max image, but the min is very small, then we can use the max for both.     
+                        if maxset and min < 2000:
+                            minImage = maxImage
+                            minset = True
+                            print(f"Image Fudge {hash_parts[0][:20]}  min image size: {min} bytes, max image size: {max} bytes")
+                        else:
+                            print(f"good Image Sizes {hash_parts[0][:20]}  min image size: {min} bytes, max image size: {max} bytes")
                         # Now resize them once and for all.
                         if minset: 
                             readyRow[cover_index] = process_image(minImage)
@@ -605,7 +635,6 @@ def insert_readerware_into_sqlite(cursor, con):
                 except Exception as e:
                                 print(e)
                 # readyRow[0] = None
-                msg = f"({readyRow[:2]} , {table} )"
                 cursor.execute(f'INSERT INTO {table} ({column_list}) VALUES ({placeholders})', readyRow)
                 if table == "READERWARE" :
                     insert_count += 1
@@ -648,7 +677,7 @@ def processRWbackup( srcPath, targetDBpath) -> None:
 
     global sortedInserts, originalRWschema, schemas
 
-    with open(srcPath, "r") as fin:
+    with open(srcPath, "r", encoding="UTF8") as fin:
         for line in fin.readlines():
             if line.startswith("INSERT INTO"):  
                 if line.startswith("INSERT INTO READERWARE VALUES"):
@@ -698,7 +727,7 @@ def processRWbackup( srcPath, targetDBpath) -> None:
                     cursor.execute(schemas[table][createSQL])
                 except Exception as e:
                     print(e)
-            
+
             con.commit()
             # Now that all the table schemas have been created, we add these indexes
             for table, text_col in [
@@ -712,13 +741,14 @@ def processRWbackup( srcPath, targetDBpath) -> None:
                 try:
                     cn = f"{table}".lower().replace("_list","")
                     # print(table, text_col)
-                    cursor.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_{cn} ON [{table}](UPPER({text_col}))")
+                    cursor.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{cn} ON [{table}](UPPER({text_col}))")
                     # print(table, text_col)
                 except sqlite3.OperationalError: 
                     pass
                 except Exception as e: 
                     print(e)
             con.commit()
+
 
             try:
                 insert_readerware_into_sqlite(cursor, con) 
@@ -734,23 +764,19 @@ def processRWbackup( srcPath, targetDBpath) -> None:
 PROVENANCE_MAP = {
     "Books To Read Next.rw3.bkup.script": "Personal Backlog",
     "BorrowedBooks.rw3.bkup.script" : "Borrowed",
-    "MyOwnBooksB.rw3.bkup.script" : "rpbiss",
-    "BookCatalog.rw3.bkup.script": "BookCatalog",
-    "McCollough.rw3.bkup.script": "McCollough",
-    "Readerware.rw3.bkup.script": "Readerware",
-    "NewMcCollough.rw3.bkup.script": "Evansville Public Library",
+    "MyOwnBooks.rw3.bkup.script" : "rpbiss",
+    "BookCatalog.rw3.bkup.script" : "EVPL Catalog",
+    "McCollough.rw3.bkup.script" : "McCollough Collection",
+    "NewMcCollough.rw3.bkup.script": "Evansville Public Library"
+
     # Add more: {"filename": "Human-readable label"}
 }
 
 
 def main(dry_run=False):
     global provenance, import_time 
-    if len(sys.argv) < 2:
-        print("Usage: python hsql2sqlite.py <script_or_folder> ")
-        sys.exit(1)
-
-    paths = []
-    base = Path(sys.argv[1])
+# hardcode in the source for the Readerware backup scripts, and the target output directory.  You could easily change this to be command line arguments or a config file if you wanted to run this on more than one batch of files, but I only have one batch of files so...
+    base = Path("Readerware-HSQLDB-backupScripts")
 
 
     output_dir = Path.cwd() / "rw_converted"
